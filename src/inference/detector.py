@@ -2,20 +2,29 @@ from ultralytics import YOLO
 
 
 class Detector:
-    def __init__(self, model_path="yolo26n.pt", confidence=0.5, tracker="bytetrack.yaml"):
+    def __init__(self, model_path="yolo26n.pt", confidence=0.5,
+                 tracker="bytetrack.yaml", track=True):
         self.model = YOLO(model_path)
         self.confidence = confidence
         self.tracker = tracker
+        self.track = track  # True: с Track ID (люди), False: просто детекция (PPE)
 
     def predict(self, frame):
-        # track() = detect + ByteTrack; persist=True сохраняет ID между кадрами
-        results = self.model.track(
-            frame,
-            conf=self.confidence,
-            tracker=self.tracker,
-            persist=True,
-            verbose=False,
-        )
+        if self.track:
+            # track() = detect + ByteTrack; persist=True сохраняет ID между кадрами
+            results = self.model.track(
+                frame,
+                conf=self.confidence,
+                tracker=self.tracker,
+                persist=True,
+                verbose=False,
+            )
+        else:
+            results = self.model.predict(
+                frame,
+                conf=self.confidence,
+                verbose=False,
+            )
 
         detections = []
 

@@ -1,3 +1,4 @@
+import argparse
 import json
 import time
 import logging
@@ -13,6 +14,12 @@ from src.events.event_engine import EventEngine
 from src.zones.geometry import bottom_center, to_pixels, point_in_polygon
 from src.monitoring.metrics import Metrics
 from src.monitoring.logger import setup_logging
+from src.analytics.ppe import ppe_violations
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--source", default=None,
+                    help="0 — камера, либо путь к видеофайлу (по умолчанию из конфига)")
+args = parser.parse_args()
 
 setup_logging()
 log = logging.getLogger("vision")
@@ -22,6 +29,8 @@ cfg = load_config()
 CAM_ID = cfg["camera"]["id"]
 STATUS_FILE = Path(cfg["storage"]["root"]) / "status.json"
 STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+PPE_EVENTS = ("ppe_helmet_missing", "ppe_vest_missing")
 
 
 def write_status(camera, fps, inference_ms):
@@ -35,12 +44,48 @@ def write_status(camera, fps, inference_ms):
     STATUS_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
-source = VideoSource(source=cfg["camera"]["source"], reconnect_sec=cfg["camera"]["reconnect_sec"])
+# Источник видео: параметр --source важнее конфига
+if args.source is None:
+    src_value = cfg["camera"]["source"]
+else:
+    src_value = int(args.source) if args.source.isdigit() else args.source
+log.info("Источник видео: %s", src_value)
+
+source = VideoSource(source=src_value, reconnect_sec=cfg["camera"]["reconnect_sec"])
+
+# Основной детектор: люди + Track ID
 detector = Detector(
     cfg["models"]["detector_path"],
     confidence=cfg["models"]["person_confidence"],
     tracker=cfg["models"]["tracker"],
 )
+
+# PPE-детектор (каска / голова без каски / жилет): без tracking.
+# Если весов ещё нет, контроль СИЗ просто отключается.
+ppe_path = cfg["models"].get("ppe_path")
+ppe_detector = None
+if ppe_path and Path(ppe_path).exists():
+    ppe_detector = Detector(ppe_path, confidence=cfg["models"]["ppe_confidence"], track=False)
+    log.info("PPE-модель загружена: %s", ppe_path)
+else:
+    log.warning("PPE-модель не найдена (%s), контроль СИЗ отключён", ppe_path)
+
+# Детектор дыма и огня (без tracking)
+fire_path = cfg["models"].get("fire_smoke_path")
+fire_detector = None
+fire_conf = {}
+if fire_path and Path(fire_path).exists():
+    fire_conf = {
+        "fire": cfg["models"]["fire_confidence"],
+        "smoke": cfg["models"]["smoke_confidence"],
+    }
+    fire_detector = Detector(fire_path, confidence=min(fire_conf.values()), track=False)
+    log.info("Модель дыма/огня загружена: %s", fire_path)
+else:
+    log.warning("Модель дыма/огня не найдена (%s), контроль отключён", fire_path)
+
+extra_every = cfg["models"].get("extra_every", 1)
+
 fps_meter = FPSMeter()
 metrics = Metrics()
 engine = EventEngine(
@@ -51,15 +96,18 @@ engine = EventEngine(
     cooldown_sec=cfg["events"]["cooldown_sec"],
 )
 zone_norm = cfg["zones"]["restricted_01"]
+min_person_height = cfg["models"].get("min_person_height", 120)
 
 camera_lost = False
 last_status = 0.0
 fps, inference_ms = 0.0, 0.0
+frame_idx = 0
+ppe_dets, fire_dets = [], []
 
 try:
     source.open()
-    log.info("Камера подключена")
-    print("Камера подключена. Нажмите Q для выхода.")
+    log.info("Источник подключён")
+    print(f"Источник подключён ({src_value}). Нажмите Q для выхода.")
 
     while True:
         # --- получение кадра с обработкой потери потока ---
@@ -81,12 +129,16 @@ try:
         h, w = frame.shape[:2]
         polygon_px = to_pixels(zone_norm, w, h)
 
-        # --- inference + tracking ---
+        # --- inference: люди (каждый кадр), СИЗ и дым/огонь (каждый extra_every-й) ---
         start = metrics.start_timer()
         detections = detector.predict(frame)
+        if frame_idx % extra_every == 0:
+            ppe_dets = ppe_detector.predict(frame) if ppe_detector else []
+            fire_dets = fire_detector.predict(frame) if fire_detector else []
+        frame_idx += 1
         inference_ms = metrics.get_inference_time(start)
 
-        # --- аналитика: кто из людей сейчас в зоне ---
+        # --- аналитика 1: кто из людей сейчас в зоне ---
         active = {}
         for obj in detections:
             if obj["class_name"] != "person" or obj["track_id"] is None:
@@ -98,8 +150,37 @@ try:
                     {"x": round(point[0] / w, 3), "y": round(point[1] / h, 3)},
                 )
 
-        # --- Event Engine решает, создавать ли событие ---
         engine.process("person_in_restricted_zone", active, frame)
+
+        # --- аналитика 2: нарушения СИЗ ---
+        if ppe_detector:
+            ppe_active = {event_type: {} for event_type in PPE_EVENTS}
+            for obj in detections:
+                if obj["class_name"] != "person" or obj["track_id"] is None:
+                    continue
+                px, py = bottom_center(obj)
+                for violation in ppe_violations(obj, ppe_dets, min_person_height):
+                    ppe_active[violation][obj["track_id"]] = (
+                        obj["confidence"],
+                        {"x": round(px / w, 3), "y": round(py / h, 3)},
+                    )
+            # вызываем каждый кадр, чтобы окна N из M обновлялись и без нарушений
+            for event_type, act in ppe_active.items():
+                engine.process(event_type, act, frame)
+
+        # --- аналитика 3: огонь и дым (по кадру, без Track ID) ---
+        if fire_detector:
+            for cls in ("fire", "smoke"):
+                hits = [d for d in fire_dets
+                        if d["class_name"] == cls and d["confidence"] >= fire_conf[cls]]
+                act = {}
+                if hits:
+                    best = max(hits, key=lambda d: d["confidence"])
+                    cx = (best["x1"] + best["x2"]) // 2
+                    cy = (best["y1"] + best["y2"]) // 2
+                    act[0] = (best["confidence"], {"x": round(cx / w, 3), "y": round(cy / h, 3)})
+                # вызываем каждый кадр, чтобы окно N из M обновлялось
+                engine.process(f"{cls}_detected", act, frame)
 
         # --- отрисовка ---
         cv2.polylines(frame, [np.array(polygon_px, dtype=np.int32)], True, (255, 0, 0), 2)
@@ -111,6 +192,19 @@ try:
             cv2.rectangle(frame, (obj["x1"], obj["y1"]), (obj["x2"], obj["y2"]), color, 2)
             cv2.putText(frame, label, (obj["x1"], max(obj["y1"] - 10, 20)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        for p in ppe_dets:
+            cv2.rectangle(frame, (p["x1"], p["y1"]), (p["x2"], p["y2"]), (0, 200, 255), 1)
+            cv2.putText(frame, f'{p["class_name"]} {p["confidence"]:.2f}',
+                        (p["x1"], max(p["y1"] - 5, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+
+        for d in fire_dets:
+            if d["confidence"] >= fire_conf.get(d["class_name"], 1.0):
+                cv2.rectangle(frame, (d["x1"], d["y1"]), (d["x2"], d["y2"]), (0, 0, 255), 2)
+                cv2.putText(frame, f'{d["class_name"]} {d["confidence"]:.2f}',
+                            (d["x1"], max(d["y1"] - 8, 15)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
         fps = fps_meter.tick()
         cv2.putText(frame, f"FPS: {fps:.1f}", (20, h - 70),

@@ -5,8 +5,15 @@ camera:
 
 models:
   detector_path: "yolo26n.pt"
-  person_confidence: 0.50
+  person_confidence: 0.60
   tracker: "bytetrack.yaml"
+  ppe_path: "models/ppe.pt"
+  ppe_confidence: 0.40
+  min_person_height: 120
+  fire_smoke_path: "models/fire_smoke.pt"
+  fire_confidence: 0.65
+  smoke_confidence: 0.50
+  extra_every: 2
 
 zones:
   restricted_01:         # нормированные координаты [0;1]
@@ -22,3 +29,7 @@ events:
 
 storage:
   root: "events"
+
+ppe_path: "models/ppe.pt"
+ppe_confidence: 0.40     # предварительно, выберем по таблице P/R/F1
+min_person_height: 120
