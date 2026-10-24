@@ -3,9 +3,16 @@
 __pycache__/
 *.pyc
 .env
-models/*.pt
+*.pt
 data/*
 datasets/*
 events/*
+runs/
+*.onnx
+bus.jpg
 logs/*
 "@ | Set-Content .gitignore -Encoding utf8
+
+
+
+
