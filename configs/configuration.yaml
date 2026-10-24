@@ -1,0 +1,24 @@
+camera:
+  id: cam_01
+  source: 0              # 0 = камера; можно путь к видеофайлу
+  reconnect_sec: 2
+
+models:
+  detector_path: "yolo26n.pt"
+  person_confidence: 0.50
+  tracker: "bytetrack.yaml"
+
+zones:
+  restricted_01:         # нормированные координаты [0;1]
+    - [0.15, 0.20]
+    - [0.85, 0.20]
+    - [0.90, 0.90]
+    - [0.10, 0.90]
+
+events:
+  confirmation_n: 3      # детекция в N из последних M кадров
+  confirmation_m: 5
+  cooldown_sec: 10
+
+storage:
+  root: "events"

@@ -1,55 +1,95 @@
-
 import json
 import time
+import logging
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime
+from uuid import uuid4
+
+import cv2
+
+from src.analytics.temporal import TemporalConfirm
+
+log = logging.getLogger("vision.events")
+
+
+@dataclass
+class Event:
+    event_id: str
+    event_type: str
+    timestamp: str
+    camera_id: str
+    confidence: float
+    track_id: int | None
+    coordinates: dict
+    snapshot: str | None
+    status: str = "new"
 
 
 class EventEngine:
-    def __init__(self, confirmation_time=2):
-        self.confirmation_time = confirmation_time
-        self.start_time = None
-        self.event_created = False
+    def __init__(self, camera_id, root="events", n=3, m=5, cooldown_sec=10):
+        self.camera_id = camera_id
+        self.root = Path(root)
+        self.n, self.m = n, m
+        self.cooldown_sec = cooldown_sec
 
-        self.events_file = Path("events/events.json")
-        self.events_file.parent.mkdir(parents=True, exist_ok=True)
+        self.windows = {}    # event_type -> {track_id: TemporalConfirm}
+        self.fired = set()   # (event_type, track_id), по которым событие уже создано
+        self.last_emit = {}  # event_type -> время последнего события
 
-    def update(self, person_in_roi):
-        current_time = time.perf_counter()
+    def process(self, event_type, active, frame):
+        """active: {track_id: (confidence, coordinates)} для объектов,
+        у которых условие выполнено в ЭТОМ кадре."""
+        windows = self.windows.setdefault(event_type, {})
 
-        # Если человек находится в зоне
-        if person_in_roi:
-            if self.start_time is None:
-                self.start_time = current_time
+        for track_id in active:
+            windows.setdefault(track_id, TemporalConfirm(self.n, self.m))
 
-            duration = current_time - self.start_time
+        for track_id, tc in list(windows.items()):
+            present = track_id in active
+            confirmed = tc.update(present)
 
-            # Подтверждаем событие после 2 секунд
-            if duration >= self.confirmation_time and not self.event_created:
-                event = {
-                    "event_type": "person_in_roi",
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    "duration_seconds": round(duration, 2),
-                    "description": "Человек находится в контролируемой зоне"
-                }
+            # Трек давно не в зоне: забываем его, он сможет создать новое событие
+            if not present and not any(tc.window):
+                del windows[track_id]
+                self.fired.discard((event_type, track_id))
+                continue
 
-                # Читаем предыдущие события
-                if self.events_file.exists():
-                    with self.events_file.open("r", encoding="utf-8") as file:
-                        events = json.load(file)
-                else:
-                    events = []
+            key = (event_type, track_id)
+            if present and confirmed and key not in self.fired:
+                if time.perf_counter() - self.last_emit.get(event_type, -1e9) < self.cooldown_sec:
+                    continue  # cooldown
+                conf, coords = active[track_id]
+                self.emit(event_type, conf, track_id, coords, frame)
+                self.fired.add(key)
 
-                events.append(event)
+    def emit(self, event_type, confidence, track_id, coordinates, frame=None):
+        event = Event(
+            event_id=str(uuid4()),
+            event_type=event_type,
+            timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            camera_id=self.camera_id,
+            confidence=round(float(confidence), 3),
+            track_id=track_id,
+            coordinates=coordinates,
+            snapshot=None,
+        )
 
-                # Сохраняем обновлённый список
-                with self.events_file.open("w", encoding="utf-8") as file:
-                    json.dump(events, file, ensure_ascii=False, indent=4)
+        # events/YYYY/MM/DD/<uuid>/
+        now = datetime.now()
+        folder = self.root / f"{now:%Y}" / f"{now:%m}" / f"{now:%d}" / event.event_id
+        folder.mkdir(parents=True, exist_ok=True)
 
-                print("Событие зарегистрировано:", event)
-                self.event_created = True
+        if frame is not None:
+            snapshot_path = folder / "snapshot.jpg"
+            ok, buf = cv2.imencode(".jpg", frame)
+            if ok:
+                buf.tofile(str(snapshot_path))  # безопасно для не-ASCII путей
+                event.snapshot = snapshot_path.as_posix()
 
-        else:
-            # Если человек вышел из зоны, начинаем отсчёт заново
-            self.start_time = None
-            self.event_created = False
+        with (folder / "event.json").open("w", encoding="utf-8") as file:
+            json.dump(asdict(event), file, ensure_ascii=False, indent=4)
+
+        self.last_emit[event_type] = time.perf_counter()
+        log.info("EVENT %s track=%s conf=%.2f", event_type, track_id, confidence)
+        return event
