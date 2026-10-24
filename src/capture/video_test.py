@@ -1,26 +1,24 @@
+
 import cv2
-import time
-camera = cv2.VideoCapture(0)
 
-if not camera.isOpened():
-    print("Ошибка: не удалось открыть камеру")
-else:
-    print("Камера запущена. Нажмите Q для выхода.")
+from video_capture import VideoSource, FPSMeter
 
-    frames = 0
-    start_time = time.time()
+
+# 0 — встроенная или подключённая камера
+source = VideoSource(source=0, reconnect_sec=2)
+fps_meter = FPSMeter()
+
+try:
+    source.open()
+    print("Камера подключена. Нажмите Q для выхода.")
 
     while True:
-        success, frame = camera.read()
+        frame = source.read()
 
-        if not success:
-            print("Не удалось получить кадр")
-            break
+        # Рассчитываем FPS
+        fps = fps_meter.tick()
 
-        frames += 1
-        elapsed = time.time() - start_time
-        fps = frames / elapsed if elapsed > 0 else 0
-
+        # Выводим FPS на изображение
         cv2.putText(
             frame,
             f"FPS: {fps:.1f}",
@@ -36,5 +34,9 @@ else:
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
-    camera.release()
+except Exception as error:
+    print(f"Ошибка видеопотока: {error}")
+
+finally:
+    source.close()
     cv2.destroyAllWindows()
