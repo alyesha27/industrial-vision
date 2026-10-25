@@ -6,7 +6,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-
+from src.analytics.spill import detect_spill, draw_spill_overlay
 from src.config import load_config
 from src.inference.detector import Detector
 from src.capture.video_capture import VideoSource, FPSMeter
@@ -26,6 +26,8 @@ log = logging.getLogger("vision")
 cam_log = logging.getLogger("vision.camera")
 
 cfg = load_config()
+spill_cfg = cfg.get("spill", {})
+spill_enabled = spill_cfg.get("enabled", False)
 CAM_ID = cfg["camera"]["id"]
 STATUS_FILE = Path(cfg["storage"]["root"]) / "status.json"
 STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -103,6 +105,8 @@ last_status = 0.0
 fps, inference_ms = 0.0, 0.0
 frame_idx = 0
 ppe_dets, fire_dets = [], []
+spill_mask = None
+spill_candidates = []
 
 try:
     source.open()
@@ -182,9 +186,55 @@ try:
                 # вызываем каждый кадр, чтобы окно N из M обновлялось
                 engine.process(f"{cls}_detected", act, frame)
 
-        # --- отрисовка ---
-        cv2.polylines(frame, [np.array(polygon_px, dtype=np.int32)], True, (255, 0, 0), 2)
+        # --- аналитика 4: экспериментальное обнаружение разливов ---
+        spill_frame = frame
 
+        if spill_enabled:
+            spill_mask, spill_candidates = detect_spill(
+                frame,
+                min_area=spill_cfg.get("min_area", 1200),
+                min_area_ratio=spill_cfg.get("min_area_ratio", 0.0005),
+                max_area_ratio=spill_cfg.get("max_area_ratio", 0.20),
+                min_saturation=spill_cfg.get("min_saturation", 35),
+                max_value=spill_cfg.get("max_value", 175),
+                ground_start_ratio=spill_cfg.get("ground_start_ratio", 0.45),
+            )
+
+            spill_active = {}
+
+            if spill_candidates:
+                # Пока используем самую большую найденную область.
+                best = max(spill_candidates, key=lambda c: c["area"])
+
+                spill_active[0] = (
+                    0.5,  # Условная оценка, НЕ вероятность обнаружения.
+                    {
+                        "x": round(best["center_x"] / w, 3),
+                        "y": round(best["center_y"] / h, 3),
+                    },
+                )
+
+            # Вызываем на каждом кадре, в том числе без кандидатов.
+            engine.process("spill_detected", spill_active, frame)
+
+            if spill_candidates:
+                spill_frame = draw_spill_overlay(
+                    frame, spill_mask, spill_candidates
+                )
+
+        # --- отрисовка ---
+        if spill_enabled and spill_candidates:
+            frame = draw_spill_overlay(
+                frame, spill_mask, spill_candidates
+            )
+
+        cv2.polylines(
+            frame,
+            [np.array(polygon_px, dtype=np.int32)],
+            True,
+            (255, 0, 0),
+            2,
+        )
         for obj in detections:
             in_zone = obj["track_id"] in active
             color = (0, 0, 255) if in_zone else (0, 255, 0)

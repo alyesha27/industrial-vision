@@ -33,3 +33,12 @@ storage:
 ppe_path: "models/ppe.pt"
 ppe_confidence: 0.40     # предварительно, выберем по таблице P/R/F1
 min_person_height: 120
+
+spill:
+  enabled: true
+  min_area: 1200
+  min_area_ratio: 0.0005
+  max_area_ratio: 0.20
+  min_saturation: 35
+  max_value: 175
+  ground_start_ratio: 0.45
