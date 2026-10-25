@@ -1,4 +1,4 @@
-import json
+﻿import json
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -18,7 +18,7 @@ def load_events():
 
 @app.get("/")
 def home():
-    return {"message": "Industrial Vision API работает"}
+    return {"message": "Industrial Vision API is running"}
 
 
 @app.get("/health")

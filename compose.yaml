@@ -1,0 +1,9 @@
+﻿services:
+  api:
+    build: .
+    container_name: industrial-vision-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./events:/app/events
+    restart: unless-stopped
