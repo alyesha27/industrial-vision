@@ -108,6 +108,7 @@ frame_idx = 0
 ppe_dets, fire_dets = [], []
 spill_mask = None
 spill_candidates = []
+EVENT_LABEL_SECONDS = 3
 
 try:
     source.open()
@@ -258,13 +259,63 @@ try:
             2,
         )
         for obj in detections:
-            in_zone = obj["track_id"] in active
+            track_id = obj["track_id"]
+            in_zone = track_id in active
             color = (0, 0, 255) if in_zone else (0, 255, 0)
-            label = f'{obj["class_name"]} #{obj["track_id"]} {obj["confidence"]:.2f}'
-            cv2.rectangle(frame, (obj["x1"], obj["y1"]), (obj["x2"], obj["y2"]), color, 2)
-            cv2.putText(frame, label, (obj["x1"], max(obj["y1"] - 10, 20)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
+            label = (
+                f'{obj["class_name"]} #{track_id} '
+                f'{obj["confidence"]:.2f}'
+            )
+
+            cv2.rectangle(
+                frame,
+                (obj["x1"], obj["y1"]),
+                (obj["x2"], obj["y2"]),
+                color,
+                2,
+            )
+
+            # Основная подпись над рамкой
+            cv2.putText(
+                frame,
+                label,
+                (obj["x1"], max(obj["y1"] - 10, 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2,
+            )
+
+            # Ищем последнее событие для этого Track ID
+            now = time.time()
+
+            for event in reversed(engine.recent_events):
+                if event["track_id"] != track_id:
+                    continue
+
+                if now - event["timestamp"] > EVENT_LABEL_SECONDS:
+                    continue
+
+                event_label = event["event_type"]
+
+                # Подпись располагается под рамкой
+                text_y = min(
+                    obj["y2"] + 22,
+                    h - 10,
+                )
+
+                cv2.putText(
+                    frame,
+                    event_label,
+                    (obj["x1"], text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 0, 255),
+                    2,
+                )
+
+                break
         for p in ppe_dets:
             cv2.rectangle(frame, (p["x1"], p["y1"]), (p["x2"], p["y2"]), (0, 200, 255), 1)
             cv2.putText(frame, f'{p["class_name"]} {p["confidence"]:.2f}',

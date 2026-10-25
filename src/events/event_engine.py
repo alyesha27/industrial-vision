@@ -32,6 +32,7 @@ class EventEngine:
         self.root = Path(root)
         self.n, self.m = n, m
         self.cooldown_sec = cooldown_sec
+        self.recent_events = []
 
         self.windows = {}    # event_type -> {track_id: TemporalConfirm}
         self.fired = set()   # (event_type, track_id), по которым событие уже создано
@@ -92,4 +93,13 @@ class EventEngine:
 
         self.last_emit[event_type] = time.perf_counter()
         log.info("EVENT %s track=%s conf=%.2f", event_type, track_id, confidence)
+        self.recent_events.append({
+            "event_type": event_type,
+            "track_id": track_id,
+            "coordinates": coordinates,
+            "timestamp": time.time(),
+        })
+
+        # Храним только последние 100 событий
+        self.recent_events = self.recent_events[-100:]
         return event
