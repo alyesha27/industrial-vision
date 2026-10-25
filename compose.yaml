@@ -1,6 +1,20 @@
-﻿services:
+﻿
+services:
+  vision:
+    build:
+      context: .
+      dockerfile: Dockerfile.vision
+    container_name: industrial-vision
+    devices:
+      - "/dev/video0:/dev/video0"
+    volumes:
+      - ./events:/app/events
+    restart: unless-stopped
+
   api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: industrial-vision-api
     ports:
       - "8000:8000"

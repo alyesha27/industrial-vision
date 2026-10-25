@@ -1,17 +1,24 @@
-﻿FROM python:3.13-slim
+﻿
+FROM python:3.13-slim
 
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-COPY requirements-api.txt .
-RUN pip install --no-cache-dir -r requirements-api.txt
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-0 \
+    libgl1 \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src ./src
+COPY configs ./configs
+COPY models ./models
 
-RUN mkdir -p events
+RUN mkdir -p /app/events
 
-EXPOSE 8000
-
-CMD ["uvicorn", "src.api.server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "src.inference.detect_camera", "--source", "0"]

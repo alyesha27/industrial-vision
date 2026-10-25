@@ -15,5 +15,6 @@ models
 *.onnx
 *.zip
 bus.jpg
-
+__pycache__
+*.pyc
 docs/industrial_vision.ipynb

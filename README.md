@@ -105,24 +105,10 @@ API позволяет обращаться к реализованным HTTP-e
 
 Убедитесь, что Docker Desktop запущен.
 
-Если в корне проекта находится `Dockerfile`, соберите образ:
-
 ```powershell
-docker build -t industrial-vision .
-```
-
-Запуск контейнера с API:
-
-```powershell
-docker run --rm -p 8000:8000 industrial-vision
-```
-
-Эта команда применима, если образ настроен на запуск API, а сервер внутри контейнера слушает порт `8000` на интерфейсе `0.0.0.0`.
-
-Если проект содержит `compose.yaml` или `docker-compose.yml`, можно использовать:
-
-```powershell
-docker compose up --build
+git clone https://github.com/alyesha27/industrial-vision.git
+cd industrial-vision
+docker compose up --build -d
 ```
 
 Конкретный состав запускаемых сервисов определяется Docker Compose-конфигурацией проекта.
