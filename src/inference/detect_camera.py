@@ -7,11 +7,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 from src.analytics.spill import detect_spill, draw_spill_overlay
+from src.analytics.object_events import prepare_object_events
 from src.config import load_config
 from src.inference.detector import Detector
 from src.capture.video_capture import VideoSource, FPSMeter
 from src.events.event_engine import EventEngine
-from src.zones.geometry import bottom_center, to_pixels, point_in_polygon
+from src.zones.geometry import bottom_center, to_pixels
 from src.monitoring.metrics import Metrics
 from src.monitoring.logger import setup_logging
 from src.analytics.ppe import ppe_violations
@@ -142,19 +143,40 @@ try:
         frame_idx += 1
         inference_ms = metrics.get_inference_time(start)
 
-        # --- аналитика 1: кто из людей сейчас в зоне ---
-        active = {}
-        for obj in detections:
-            if obj["class_name"] != "person" or obj["track_id"] is None:
-                continue
-            point = bottom_center(obj)
-            if point_in_polygon(point, polygon_px):
-                active[obj["track_id"]] = (
-                    obj["confidence"],
-                    {"x": round(point[0] / w, 3), "y": round(point[1] / h, 3)},
-                )
 
-        engine.process("person_in_restricted_zone", active, frame)
+        # --- аналитика 1: обнаружение людей и транспорта ---
+        person_active, person_zone_active, vehicle_zone_active = (
+            prepare_object_events(
+                detections,
+                polygon_px,
+                w,
+                h,
+            )
+        )
+
+        # Обнаружение человека в любом месте кадра
+        engine.process(
+            "person_detected",
+            person_active,
+            frame,
+        )
+
+        # Человек внутри запретной зоны
+        engine.process(
+            "person_in_restricted_zone",
+            person_zone_active,
+            frame,
+        )
+
+        # Транспорт внутри запретной зоны
+        engine.process(
+            "vehicle_in_restricted_zone",
+            vehicle_zone_active,
+            frame,
+        )
+
+        # Для отрисовки красным отмечаем объекты в запретной зоне
+        active = person_zone_active
 
         # --- аналитика 2: нарушения СИЗ ---
         if ppe_detector:
