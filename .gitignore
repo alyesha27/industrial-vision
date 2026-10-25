@@ -1,18 +1,17 @@
-@"
-.venv/
+﻿.venv/
 __pycache__/
 *.pyc
 .env
 *.pt
+*.onnx
 data/*
 datasets/*
 events/*
 runs/
-*.onnx
 bus.jpg
 logs/*
-"@ | Set-Content .gitignore -Encoding utf8
-
-
-
-
+.idea/
+*.mp4
+*.avi
+*.mov
+*.zip
