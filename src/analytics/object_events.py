@@ -1,53 +1,41 @@
-﻿from src.zones.geometry import bottom_center, point_in_polygon
+from src.zones.anchors import bottom_center_point, zone_hit
+
+VEHICLE_CLASSES = ("car", "truck", "bus")
+DEFAULT_ANCHOR_MODE = {"person": "bottom_center", "vehicle": "any"}
 
 
-VEHICLE_CLASSES = {
-    "car",
-    "truck",
-    "bus",
-    "motorcycle",
-    "bicycle",
-}
+def prepare_object_events(detections, polygon_px, w, h,
+                          anchor_mode=None, vehicle_classes=VEHICLE_CLASSES):
+    """Готовит словари {track_id: (confidence, {"x", "y"})} для Event Engine.
 
-
-def prepare_object_events(detections, polygon_px, width, height):
-    """Подготавливает события обнаружения человека и транспорта.
-
-    Возвращает:
-    1. person_active — все обнаруженные люди с Track ID;
-    2. person_zone_active — люди внутри запретной зоны;
-    3. vehicle_zone_active — транспорт внутри запретной зоны.
-
-    Формат значений совместим с EventEngine:
-    track_id: (confidence, {"x": ..., "y": ...})
+    Возвращает: person_active, person_zone_active, vehicle_zone_active.
+    anchor_mode: {"person": режим, "vehicle": режим}, см. src/zones/anchors.py
     """
+    modes = dict(DEFAULT_ANCHOR_MODE)
+    modes.update(anchor_mode or {})
+
     person_active = {}
     person_zone_active = {}
     vehicle_zone_active = {}
+
+    def norm(point):
+        return {"x": round(point[0] / w, 3), "y": round(point[1] / h, 3)}
 
     for obj in detections:
         track_id = obj.get("track_id")
         if track_id is None:
             continue
+        name = obj["class_name"]
+        conf = obj["confidence"]
 
-        class_name = str(obj.get("class_name", "")).lower()
-        point = bottom_center(obj)
-
-        coordinates = {
-            "x": round(point[0] / width, 3),
-            "y": round(point[1] / height, 3),
-        }
-        event_data = (obj["confidence"], coordinates)
-
-        inside_zone = point_in_polygon(point, polygon_px)
-
-        if class_name == "person":
-            person_active[track_id] = event_data
-
-            if inside_zone:
-                person_zone_active[track_id] = event_data
-
-        elif class_name in VEHICLE_CLASSES and inside_zone:
-            vehicle_zone_active[track_id] = event_data
+        if name == "person":
+            person_active[track_id] = (conf, norm(bottom_center_point(obj)))
+            point = zone_hit(obj, polygon_px, modes["person"])
+            if point is not None:
+                person_zone_active[track_id] = (conf, norm(point))
+        elif name in vehicle_classes:
+            point = zone_hit(obj, polygon_px, modes["vehicle"])
+            if point is not None:
+                vehicle_zone_active[track_id] = (conf, norm(point))
 
     return person_active, person_zone_active, vehicle_zone_active

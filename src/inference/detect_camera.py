@@ -1,5 +1,7 @@
 import argparse
 import json
+import os
+import signal
 import time
 import logging
 from pathlib import Path
@@ -20,7 +22,10 @@ from src.analytics.ppe import ppe_violations
 parser = argparse.ArgumentParser()
 parser.add_argument("--source", default=None,
                     help="0 — камера, либо путь к видеофайлу (по умолчанию из конфига)")
+parser.add_argument("--no-show", action="store_true",
+                    help="без окна с видео (Docker, плата без экрана)")
 args = parser.parse_args()
+HEADLESS = args.no_show or os.environ.get("HEADLESS") == "1"
 
 setup_logging()
 log = logging.getLogger("vision")
@@ -34,14 +39,29 @@ STATUS_FILE = Path(cfg["storage"]["root"]) / "status.json"
 STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 PPE_EVENTS = ("ppe_helmet_missing", "ppe_vest_missing")
+PERSON_VEHICLE_CLASSES = {"person", "car", "truck", "bus"}
+PPE_CLASSES = {"helmet", "head", "vest"}
+# класс модели -> тип события
+HAZARD_EVENT = {"fire": "fire_detected", "smoke": "smoke_detected", "water": "spill_detected"}
+
+# Корректная остановка по SIGTERM (docker stop) и по Q
+stop_requested = False
 
 
-def write_status(camera, fps, inference_ms):
+def _request_stop(signum, _frame):
+    global stop_requested
+    stop_requested = True
+
+
+signal.signal(signal.SIGTERM, _request_stop)
+
+
+def write_status(camera, fps, inference_ms, model="loaded"):
     data = {
         "camera": camera,
         "fps": round(fps, 1),
         "inference_ms": round(inference_ms, 1),
-        "model": "loaded",
+        "model": model,
         "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     STATUS_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -56,38 +76,52 @@ log.info("Источник видео: %s", src_value)
 
 source = VideoSource(source=src_value, reconnect_sec=cfg["camera"]["reconnect_sec"])
 
-# Основной детектор: люди + Track ID
-detector = Detector(
-    cfg["models"]["detector_path"],
-    confidence=cfg["models"]["person_confidence"],
-    tracker=cfg["models"]["tracker"],
-)
+# ---------------------------------------------------------------- модели
+models_cfg = cfg["models"]
+unified_path = models_cfg.get("unified_path")
+UNIFIED = bool(unified_path and Path(unified_path).exists())
 
-# PPE-детектор (каска / голова без каски / жилет): без tracking.
-# Если весов ещё нет, контроль СИЗ просто отключается.
-ppe_path = cfg["models"].get("ppe_path")
-ppe_detector = None
-if ppe_path and Path(ppe_path).exists():
-    ppe_detector = Detector(ppe_path, confidence=cfg["models"]["ppe_confidence"], track=False)
-    log.info("PPE-модель загружена: %s", ppe_path)
+detector = ppe_detector = fire_detector = unified = None
+hazard_conf = {}
+
+if UNIFIED:
+    # Одна модель на все классы: person, car, truck, bus, helmet, head, vest, fire, smoke, water
+    class_conf = dict(models_cfg["class_confidence"])
+    unified = Detector(unified_path, tracker=models_cfg["tracker"], class_conf=class_conf)
+    hazard_conf = {c: class_conf[c] for c in HAZARD_EVENT if c in class_conf}
+    ppe_enabled = True
+    hazard_enabled = True
+    log.info("Единая модель загружена: %s (классы: %s)", unified_path,
+             ", ".join(unified.model.names.values()))
 else:
-    log.warning("PPE-модель не найдена (%s), контроль СИЗ отключён", ppe_path)
+    # Режим из трёх моделей (если единая модель ещё не обучена)
+    detector = Detector(
+        models_cfg["detector_path"],
+        confidence=models_cfg["person_confidence"],
+        tracker=models_cfg["tracker"],
+    )
+    ppe_path = models_cfg.get("ppe_path")
+    if ppe_path and Path(ppe_path).exists():
+        ppe_detector = Detector(ppe_path, confidence=models_cfg["ppe_confidence"], track=False)
+        log.info("PPE-модель загружена: %s", ppe_path)
+    else:
+        log.warning("PPE-модель не найдена (%s), контроль СИЗ отключён", ppe_path)
 
-# Детектор дыма и огня (без tracking)
-fire_path = cfg["models"].get("fire_smoke_path")
-fire_detector = None
-fire_conf = {}
-if fire_path and Path(fire_path).exists():
-    fire_conf = {
-        "fire": cfg["models"]["fire_confidence"],
-        "smoke": cfg["models"]["smoke_confidence"],
-    }
-    fire_detector = Detector(fire_path, confidence=min(fire_conf.values()), track=False)
-    log.info("Модель дыма/огня загружена: %s", fire_path)
-else:
-    log.warning("Модель дыма/огня не найдена (%s), контроль отключён", fire_path)
+    fire_path = models_cfg.get("fire_smoke_path")
+    if fire_path and Path(fire_path).exists():
+        hazard_conf = {"fire": models_cfg["fire_confidence"],
+                       "smoke": models_cfg["smoke_confidence"]}
+        fire_detector = Detector(fire_path, confidence=min(hazard_conf.values()), track=False)
+        log.info("Модель дыма/огня загружена: %s", fire_path)
+    else:
+        log.warning("Модель дыма/огня не найдена (%s), контроль отключён", fire_path)
+    ppe_enabled = ppe_detector is not None
+    hazard_enabled = fire_detector is not None
 
-extra_every = cfg["models"].get("extra_every", 1)
+# Разлив: если единая модель умеет класс water, эвристика не нужна
+use_spill_heuristic = spill_enabled and not (UNIFIED and "water" in hazard_conf)
+
+extra_every = models_cfg.get("extra_every", 1)
 
 fps_meter = FPSMeter()
 metrics = Metrics()
@@ -99,13 +133,14 @@ engine = EventEngine(
     cooldown_sec=cfg["events"]["cooldown_sec"],
 )
 zone_norm = cfg["zones"]["restricted_01"]
-min_person_height = cfg["models"].get("min_person_height", 120)
+anchor_mode = cfg["zones"].get("anchor_mode", {})
+min_person_height = models_cfg.get("min_person_height", 120)
 
 camera_lost = False
 last_status = 0.0
 fps, inference_ms = 0.0, 0.0
 frame_idx = 0
-ppe_dets, fire_dets = [], []
+detections, ppe_dets, hazard_dets = [], [], []
 spill_mask = None
 spill_candidates = []
 EVENT_LABEL_SECONDS = 3
@@ -113,9 +148,10 @@ EVENT_LABEL_SECONDS = 3
 try:
     source.open()
     log.info("Источник подключён")
-    print(f"Источник подключён ({src_value}). Нажмите Q для выхода.")
+    print(f"Источник подключён ({src_value}). "
+          + ("Остановка: Ctrl+C." if HEADLESS else "Нажмите Q для выхода."))
 
-    while True:
+    while not stop_requested:
         # --- получение кадра с обработкой потери потока ---
         try:
             frame = source.read()
@@ -135,52 +171,35 @@ try:
         h, w = frame.shape[:2]
         polygon_px = to_pixels(zone_norm, w, h)
 
-        # --- inference: люди (каждый кадр), СИЗ и дым/огонь (каждый extra_every-й) ---
+        # --- inference ---
         start = metrics.start_timer()
-        detections = detector.predict(frame)
-        if frame_idx % extra_every == 0:
-            ppe_dets = ppe_detector.predict(frame) if ppe_detector else []
-            fire_dets = fire_detector.predict(frame) if fire_detector else []
-        frame_idx += 1
+        if UNIFIED:
+            # один проход модели на кадре, затем разбор по классам
+            all_dets = unified.predict(frame)
+            detections = [d for d in all_dets if d["class_name"] in PERSON_VEHICLE_CLASSES]
+            ppe_dets = [d for d in all_dets if d["class_name"] in PPE_CLASSES]
+            hazard_dets = [d for d in all_dets if d["class_name"] in HAZARD_EVENT]
+        else:
+            detections = detector.predict(frame)
+            if frame_idx % extra_every == 0:
+                ppe_dets = ppe_detector.predict(frame) if ppe_detector else []
+                hazard_dets = fire_detector.predict(frame) if fire_detector else []
+            frame_idx += 1
         inference_ms = metrics.get_inference_time(start)
 
-
-        # --- аналитика 1: обнаружение людей и транспорта ---
-        person_active, person_zone_active, vehicle_zone_active = (
-            prepare_object_events(
-                detections,
-                polygon_px,
-                w,
-                h,
-            )
+        # --- аналитика 1: люди и транспорт ---
+        person_active, person_zone_active, vehicle_zone_active = prepare_object_events(
+            detections, polygon_px, w, h, anchor_mode=anchor_mode,
         )
-
-        # Обнаружение человека в любом месте кадра
-        engine.process(
-            "person_detected",
-            person_active,
-            frame,
-        )
-
-        # Человек внутри запретной зоны
-        engine.process(
-            "person_in_restricted_zone",
-            person_zone_active,
-            frame,
-        )
-
-        # Транспорт внутри запретной зоны
-        engine.process(
-            "vehicle_in_restricted_zone",
-            vehicle_zone_active,
-            frame,
-        )
+        engine.process("person_detected", person_active, frame)
+        engine.process("person_in_restricted_zone", person_zone_active, frame)
+        engine.process("vehicle_in_restricted_zone", vehicle_zone_active, frame)
 
         # Для отрисовки красным отмечаем объекты в запретной зоне
         active = person_zone_active
 
         # --- аналитика 2: нарушения СИЗ ---
-        if ppe_detector:
+        if ppe_enabled:
             ppe_active = {event_type: {} for event_type in PPE_EVENTS}
             for obj in detections:
                 if obj["class_name"] != "person" or obj["track_id"] is None:
@@ -195,11 +214,13 @@ try:
             for event_type, act in ppe_active.items():
                 engine.process(event_type, act, frame)
 
-        # --- аналитика 3: огонь и дым (по кадру, без Track ID) ---
-        if fire_detector:
-            for cls in ("fire", "smoke"):
-                hits = [d for d in fire_dets
-                        if d["class_name"] == cls and d["confidence"] >= fire_conf[cls]]
+        # --- аналитика 3: огонь, дым, вода/разлив (по кадру, без Track ID) ---
+        if hazard_enabled:
+            for cls, event_type in HAZARD_EVENT.items():
+                if cls not in hazard_conf:
+                    continue
+                hits = [d for d in hazard_dets
+                        if d["class_name"] == cls and d["confidence"] >= hazard_conf[cls]]
                 act = {}
                 if hits:
                     best = max(hits, key=lambda d: d["confidence"])
@@ -207,12 +228,10 @@ try:
                     cy = (best["y1"] + best["y2"]) // 2
                     act[0] = (best["confidence"], {"x": round(cx / w, 3), "y": round(cy / h, 3)})
                 # вызываем каждый кадр, чтобы окно N из M обновлялось
-                engine.process(f"{cls}_detected", act, frame)
+                engine.process(event_type, act, frame)
 
-        # --- аналитика 4: экспериментальное обнаружение разливов ---
-        spill_frame = frame
-
-        if spill_enabled:
+        # --- аналитика 4: эвристика разливов (только если нет класса water) ---
+        if use_spill_heuristic:
             spill_mask, spill_candidates = detect_spill(
                 frame,
                 min_area=spill_cfg.get("min_area", 1200),
@@ -222,13 +241,10 @@ try:
                 max_value=spill_cfg.get("max_value", 175),
                 ground_start_ratio=spill_cfg.get("ground_start_ratio", 0.45),
             )
-
             spill_active = {}
-
             if spill_candidates:
                 # Пока используем самую большую найденную область.
                 best = max(spill_candidates, key=lambda c: c["area"])
-
                 spill_active[0] = (
                     0.5,  # Условная оценка, НЕ вероятность обнаружения.
                     {
@@ -236,98 +252,50 @@ try:
                         "y": round(best["center_y"] / h, 3),
                     },
                 )
-
             # Вызываем на каждом кадре, в том числе без кандидатов.
             engine.process("spill_detected", spill_active, frame)
 
-            if spill_candidates:
-                spill_frame = draw_spill_overlay(
-                    frame, spill_mask, spill_candidates
-                )
+        # --- отрисовка (без окна не нужна, но снимки событий уже сохранены) ---
+        if use_spill_heuristic and spill_candidates:
+            frame = draw_spill_overlay(frame, spill_mask, spill_candidates)
 
-        # --- отрисовка ---
-        if spill_enabled and spill_candidates:
-            frame = draw_spill_overlay(
-                frame, spill_mask, spill_candidates
-            )
+        cv2.polylines(frame, [np.array(polygon_px, dtype=np.int32)], True, (255, 0, 0), 2)
 
-        cv2.polylines(
-            frame,
-            [np.array(polygon_px, dtype=np.int32)],
-            True,
-            (255, 0, 0),
-            2,
-        )
         for obj in detections:
             track_id = obj["track_id"]
             in_zone = track_id in active
             color = (0, 0, 255) if in_zone else (0, 255, 0)
+            label = f'{obj["class_name"]} #{track_id} {obj["confidence"]:.2f}'
 
-            label = (
-                f'{obj["class_name"]} #{track_id} '
-                f'{obj["confidence"]:.2f}'
-            )
+            cv2.rectangle(frame, (obj["x1"], obj["y1"]), (obj["x2"], obj["y2"]), color, 2)
+            cv2.putText(frame, label, (obj["x1"], max(obj["y1"] - 10, 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            cv2.rectangle(
-                frame,
-                (obj["x1"], obj["y1"]),
-                (obj["x2"], obj["y2"]),
-                color,
-                2,
-            )
-
-            # Основная подпись над рамкой
-            cv2.putText(
-                frame,
-                label,
-                (obj["x1"], max(obj["y1"] - 10, 20)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2,
-            )
-
-            # Ищем последнее событие для этого Track ID
+            # Последнее событие для этого Track ID
             now = time.time()
-
             for event in reversed(engine.recent_events):
                 if event["track_id"] != track_id:
                     continue
-
                 if now - event["timestamp"] > EVENT_LABEL_SECONDS:
                     continue
-
-                event_label = event["event_type"]
-
-                # Подпись располагается под рамкой
-                text_y = min(
-                    obj["y2"] + 22,
-                    h - 10,
-                )
-
-                cv2.putText(
-                    frame,
-                    event_label,
-                    (obj["x1"], text_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 0, 255),
-                    2,
-                )
-
+                text_y = min(obj["y2"] + 22, h - 10)
+                cv2.putText(frame, event["event_type"], (obj["x1"], text_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
                 break
+
         for p in ppe_dets:
             cv2.rectangle(frame, (p["x1"], p["y1"]), (p["x2"], p["y2"]), (0, 200, 255), 1)
             cv2.putText(frame, f'{p["class_name"]} {p["confidence"]:.2f}',
                         (p["x1"], max(p["y1"] - 5, 15)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
 
-        for d in fire_dets:
-            if d["confidence"] >= fire_conf.get(d["class_name"], 1.0):
-                cv2.rectangle(frame, (d["x1"], d["y1"]), (d["x2"], d["y2"]), (0, 0, 255), 2)
+        for d in hazard_dets:
+            if d["confidence"] >= hazard_conf.get(d["class_name"], 1.0):
+                color = (255, 128, 0) if d["class_name"] == "water" else (0, 0, 255)
+                cv2.rectangle(frame, (d["x1"], d["y1"]), (d["x2"], d["y2"]), color, 2)
                 cv2.putText(frame, f'{d["class_name"]} {d["confidence"]:.2f}',
                             (d["x1"], max(d["y1"] - 8, 15)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         fps = fps_meter.tick()
         cv2.putText(frame, f"FPS: {fps:.1f}", (20, h - 70),
@@ -342,14 +310,16 @@ try:
             write_status("connected", fps, inference_ms)
             last_status = time.time()
 
-        cv2.imshow("Industrial Vision - Detection", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+        if not HEADLESS:
+            cv2.imshow("Industrial Vision - Detection", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
 except Exception:
     log.exception("Критическая ошибка")
 
 finally:
     source.close()
-    cv2.destroyAllWindows()
+    if not HEADLESS:
+        cv2.destroyAllWindows()
     write_status("stopped", 0.0, 0.0)

@@ -1,0 +1,29 @@
+# Настройка объединения датасетов в один набор для единой YOLO
+output: datasets/unified
+
+# Единый список классов (порядок = номера классов в unified.pt)
+unified_names: [person, car, truck, bus, helmet, head, vest, fire, smoke, water]
+
+# Исходные датасеты в формате YOLO. Поддерживаются раскладки
+#   path/images/<split>, path/labels/<split>   и   path/<split>/images, path/<split>/labels
+# map: имя класса в исходном data.yaml -> имя в едином списке
+sources:
+  - name: ppe
+    path: datasets/ppe
+    map: {helmet: helmet, head: head, vest: vest}
+  - name: dfire
+    path: datasets/dfire
+    map: {fire: fire, smoke: smoke}
+  - name: water
+    path: datasets/water
+    map: {water: water}          # впишите реальное имя класса из data.yaml (spill, puddle ...)
+
+# Модели-«учителя»: достраивают разметку классов, которых нет в исходном датасете
+teachers:
+  - model: yolo26n.pt
+    classes: {person: person, car: car, truck: truck, bus: bus}
+  - model: models/ppe.pt
+    classes: {helmet: helmet, head: head, vest: vest}
+  - model: models/fire_smoke.pt
+    classes: {fire: fire, smoke: smoke}
+teacher_conf: 0.5
